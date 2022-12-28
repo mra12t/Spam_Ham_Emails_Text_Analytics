@@ -1,0 +1,343 @@
+---
+title: "Separating Spam Emails from Ham"
+output: html_document
+date: "2022-12-23"
+---
+### About the Study and the Data Set
+Nearly every email user has at some point received an unsolicited message, often referred to as spam, which may contain advertisements, links to malware, or attempts to scam the recipient. A large portion, roughly 80-90%, of the over 100 billion emails sent daily are spam emails, which are often sent from botnets of infected computers. The remaining emails, called "ham" emails, are not spam.
+
+To address the high volume of spam emails being sent, most email providers offer a spam filter that automatically detects and separates likely spam messages from the ham. These filters use a variety of techniques, including checking the sender's IP address against a list of known spammers, but most rely heavily on text analytics to analyze the contents of an email.
+
+In this study, we will build and evaluate a spam filter using a publicly available dataset described in a 2006 conference paper called "Spam Filtering with Naive Bayes -- Which Naive Bayes?" by V. Metsis, I. Androutsopoulos, and G. Paliouras. The ham messages in the dataset come from the inbox of Vincent Kaminski, a former Enron Managing Director for Research, and are part of the Enron Corpus. The spam messages in the dataset include those from the SpamAssassin corpus, which consists of hand-labeled spam contributed by internet users, as well as spam collected by Project Honey Pot, a project that gathers spam and identifies spammers by publishing email addresses that humans would not contact but that bots may target with spam. The full dataset we will use is a mixture of approximately 75% ham and 25% spam messages.  
+
+The dataset consists of two fields:  
+
+
+* text: The content of the email in the form of text.  
+
+* spam: A binary variable that indicates whether or not the email is spam, with a value of 1 indicating spam and 0 indicating not spam.  
+
+### EDA
+
+```{r}
+emails = read.csv("emails.csv", stringsAsFactors = FALSE)
+str(emails)
+```
+```{r}
+library(knitr)
+x = table(emails$spam)
+kable(x)
+```
+```{r}
+barplot(x)
+```
+
+```{r}
+emails$text[1]
+emails$text[2]
+emails$text[3]
+```
+it appears that emails tend to start with the word "Subject".  
+Let's explore the length of the emails.  
+```{r}
+summary(nchar(emails$text))
+```
+```{r}
+which.max(nchar(emails$text))
+which.min(nchar(emails$text))
+emails$text[which.min(nchar(emails$text))]
+emails$spam[which.min(nchar(emails$text))]
+```
+Now that we have and idea about the data set, let's prepare the corpus.  
+
+### Preparing the Corpus
+
+```{r}
+library(tm)
+library(SnowballC)
+# Building a New Corpus
+corpus = VCorpus(VectorSource(emails$text))
+# Converting the Text to Lower Case
+corpus = tm_map(corpus, content_transformer(tolower))
+# Removing Punctuations from the Corpus
+corpus = tm_map(corpus, PlainTextDocument)
+corpus = tm_map(corpus, removePunctuation)
+# Removing Stop Words
+corpus = tm_map(corpus, removeWords, stopwords("english"))
+# Stemming the words
+corpus = tm_map(corpus, stemDocument)
+# Building a Document Term Matrix
+dtm = DocumentTermMatrix(corpus)
+dtm
+
+```
+Let's reduce the number of terms which is 28687 to a more reasonable number by reducing dtm to have only terms that appears in at least 5% of the documents. 
+```{r}
+spdtm = removeSparseTerms(dtm, 0.95)
+spdtm 
+```
+330 terms seems reasonable, Let's build the data frame now! 
+```{r}
+emailsSparse = as.data.frame(as.matrix(spdtm))
+```
+
+Let's check the most frequent term in the data frame. 
+```{r}
+which.max(colSums(emailsSparse))
+```
+```{r}
+emailsSparse$spam = emails$spam
+```
+
+Let's check the most frequent words in the Ham emails. 
+```{r}
+tail(sort(colSums(subset(emailsSparse, spam == 0))))
+```
+These appear to be the most frequent terms in the Ham Emails. 
+Now let's see the spam ones! 
+```{r}
+tail(sort(colSums(subset(emailsSparse, spam == 1))))
+```
+Since the two lists are quite different, it appears that the frequency of these words can help us predict whether an email is spam or not. However, the most frequent terms for the Ham appears to be more personalized and data-set specific which means that later on, the model need to be carefully tested before being applied to other persons! 
+
+### Splitting the Data Set into Training and Testing Data sets
+```{r}
+library(caTools)
+set.seed(123)
+spl = sample.split(emailsSparse$spam, 0.7)
+train = subset(emailsSparse, spl == TRUE)
+test = subset(emailsSparse, spl == FALSE)
+```
+
+### Building a Logistic Regression Model
+```{r}
+GLMmodel = glm(spam ~ ., data = train, family = "binomial")
+summary(GLMmodel)
+```
+
+Non of the variables is significant for our logistic regression model! 
+```{r}
+# the Model probabilities on the training set
+GLMpredtrain = predict(GLMmodel, type = "response")
+```
+
+```{r}
+table(GLMpredtrain < 0.00001)
+table(GLMpredtrain > 0.99999)
+table(GLMpredtrain > 0.00001 & GLMpredtrain < 0.99999)
+```
+```{r}
+# Accuracy on the training set
+x = table(train$spam, GLMpredtrain >= 0.5)
+kable(x)
+```
+```{r}
+(x[1]+x[4])/sum(x)
+```
+99.9%!.  
+```{r}
+library(ROCR)
+#AUC 
+predtrain = prediction(GLMpredtrain, train$spam)
+as.numeric(performance(predtrain, "auc")@y.values)
+```
+0.99 AUC as well!  
+
+It appears that our model really found a good relationship between the independent variables in the training set! Let's see how well it performs on the testing set. 
+```{r}
+GLMpredtest = predict(GLMmodel, newdata = test, type = "response")
+x = table(test$spam, GLMpredtest >= 0.5)
+kable(x)
+```
+```{r}
+# Accuracy 
+(x[1]+x[4])/sum(x)
+```
+95% accuracy on the testing set! let's check the AUC. 
+```{r}
+#auc
+predtest = prediction(GLMpredtest, test$spam)
+as.numeric(performance(predtest, "auc")@y.values)
+```
+0.96 AUC!  
+Let's further explore the other option to make a comparision between them! 
+
+### Building a CART Model
+
+```{r}
+library(rpart)
+library(rpart.plot)
+CARTmodel = rpart(spam ~., data = train, method = "class")
+prp(CARTmodel)
+```
+```{r}
+# Making Prediction
+CARTpredtrain = predict(CARTmodel)
+CARTpredtest = predict(CARTmodel, newdata = test)
+# 
+x = table(train$spam, CARTpredtrain[,2] >= 0.5)
+y = table(test$spam, CARTpredtest[,2] >= 0.5)
+kable(x)
+kable(y)
+```
+```{r}
+# Accuracy and AUC on the train set of CART model
+(x[1]+x[4])/sum(x)
+predCARTtrain = prediction(CARTpredtrain[,2], train$spam)
+as.numeric(performance(predCARTtrain, "auc")@y.values)
+```
+On the training set, the accuracy of the CART model is 94% and the area under the curve is 0.97! 
+```{r}
+# Accuracy and AUC on the test set of CART model
+(y[1]+y[4])/sum(y)
+predCARTtest = prediction(CARTpredtest[,2], test$spam)
+as.numeric(performance(predCARTtest, "auc")@y.values)
+```
+On the testing set, the accuracy of the CART model is almost 94% and the area under the curve is 0.96!
+
+### Building a Random Forest Model
+```{r}
+# altering the column name to make sure the random forest function runs properly
+train2 = train
+test2 = test
+colnames(train2) = paste0("F", colnames(train2))
+colnames(test2) = paste0("F", colnames(test2))
+# converting column to factor
+train2$Fspam = as.factor(train2$Fspam)
+```
+
+
+```{r}
+library(randomForest)
+set.seed(123)
+RFmodel = randomForest(Fspam ~., data = train2)
+```
+```{r}
+# Making Prediction
+RFpredtrain = predict(RFmodel, type = "prob")
+RFpredtest = predict(RFmodel, newdata = test2, type = "prob")
+# 
+x = table(train2$Fspam, RFpredtrain[,2] >= 0.5)
+y = table(test2$Fspam, RFpredtest[,2] >= 0.5)
+kable(x)
+kable(y)
+```
+
+
+
+```{r}
+# Accuracy and AUC on the train set of Random Forest model
+(x[1]+x[4])/sum(x)
+predRFtrain = prediction(RFpredtrain[,2], train2$Fspam)
+as.numeric(performance(predRFtrain, "auc")@y.values)
+```
+On the training set, the accuracy of the RF model is 98% and the area under the curve is 0.99!
+
+```{r}
+# Accuracy and AUC on the test set of Random Forest model
+(y[1]+y[4])/sum(y)
+predRFtest = prediction(RFpredtest[,2], test2$Fspam)
+as.numeric(performance(predRFtest, "auc")@y.values)
+```
+On the testing set, the accuracy of the RF model is almost 98% and the area under the curve is 0.99!
+
+### Summary
+In summary, when comparing the accuracy and the AUC of the three model on the training set, we found that the logistic regression model had the best performance. However, given that the near-perfect solution of the model didn't stand the test, and produced not-perfect results on the testing set, we can conclude that this is a sign of ***Over Fitting*** for the model. Also, we conclude that the random forest model is the best performer on the testing set in terms of both accuracy and AUC.  
+
+### A Problem-Specific Approach
+So far, we have used a threshold of 0.5 and accuracy as our measure of model quality when predicting whether an email is spam or not. This means that if the model's prediction is greater than 0.5, it is classified as spam, and if it is less than 0.5, it is classified as not spam. Using a threshold of 0.5 and accuracy as our measure is a good choice when we don't have a preference for one type of error over the other (false positives versus false negatives). However, if we assign a higher cost to one type of error, we may want to consider using a different threshold or a different measure of model quality.  
+
+
+Imagine that we are using the spam filter we have developed for an email provider. The provider moves all emails flagged as spam to a separate "Junk Email" folder, while all other emails are displayed in the main inbox. Many users of this email provider may never check the spam folder, meaning they will never see emails that are classified as spam by the filter and delivered to that folder. In this case, it might be more important to minimize false negatives (emails classified as not spam that should have been classified as spam) rather than false positives (emails classified as spam that should have been classified as not spam), as false negatives could lead to users missing important emails. In this case, we might want to consider using a higher threshold (e.g. 0.7) to minimize the number of false negatives, at the cost of potentially increasing the number of false positives.    
+
+***The cost associated with a false negative error is a spam email showing up in the inbox of the user causing an incontinence to the user. However, the cost of a false positive error is an important email ending up in the Junk mail where the user will miss and not see***   
+
+
+***Hence, a False Positive is more costly, and less desirable***  
+
+
+***Ideally, if the email provider collects data about how frequently the user check their junk mail, this data can be utilized to best use the model. For instance, if the user doesn't check their junk mail what so ever, we can let some emails go to the main mail while flagging them "potential scam", therefore, decreasing the cost of false positives!***    
+
+
+### Building a Possibly Better Model
+
+
+```{r}
+wordCounts = rowSums(as.matrix(dtm))
+```
+
+```{r}
+hist(wordCounts)
+```
+
+The distribution is right-skewed, meaning there are more wordCounts of smaller values. 
+
+```{r}
+hist(log(wordCounts))
+```
+
+
+In the histogram of the logarithmic scale of the date, it appears that we don't have skewness. 
+
+```{r}
+emailsSparse$LogWordsCount = log(wordCounts)
+```
+
+```{r}
+boxplot(emailsSparse$LogWordsCount~emailsSparse$spam)
+```
+
+We can see that the 1st quartile, median, and 3rd quartiles are all slightly lower for spam messages than for ham messages. 
+
+```{r}
+colnames(emailsSparse) = paste0("F", colnames(emailsSparse))
+colnames(emailsSparse) = paste0("F", colnames(emailsSparse))
+```
+
+```{r}
+train3 = subset(emailsSparse, spl == TRUE)
+test3 = subset(emailsSparse, spl == FALSE)
+```
+
+```{r}
+# New CART Model
+CARTmodel2 = rpart(FFspam ~., data = train3)
+prp(CARTmodel2)
+```
+It appears that LogWords did become a split in the new CART model. 
+
+```{r}
+train3$FFspam = as.factor(train3$FFspam)
+set.seed(123)
+RFmodel2 = randomForest(FFspam ~ ., data = train3)
+```
+
+
+
+```{r}
+# CART Prediction
+CARTpredtest2 = predict(CARTmodel2, newdata = test3)
+# RF Prediction
+RFpredtest2 = predict(RFmodel2, newdata = test3, type = "prob")
+
+x = table(test3$FFspam, CARTpredtest2 >= 0.5)
+y = table(test3$FFspam, RFpredtest2[,2] >= 0.5)
+
+kable(x)
+kable(y)
+```
+
+```{r}
+# CART Accuracy and AUC
+(x[1]+x[4])/sum(x)
+predCARTtest2 = prediction(CARTpredtest2, test3$FFspam)
+as.numeric(performance(predCARTtest2, "auc")@y.values)
+
+# RF Accuracy and AUC
+(y[1]+y[4])/sum(y)
+predRFtest2 = prediction(RFpredtest2[,2], test3$FFspam)
+as.numeric(performance(predRFtest2, "auc")@y.values)
+```
+***We can see that for the new CART model, the accuracy still almost 94% and the AUC is 0.97. And the accuracy of the Random forest model has remained at almost 98%!***
+
+***In conclusion, the addition of the new variable which is the word count, or frankly the log of it, to the model, did not improve our models after all***
